@@ -15,7 +15,6 @@ namespace ToyDisassembler
             this.PeRawBytes = peFile;
             this.PeFile = new PeFile(this.PeRawBytes);
             this.CodeReader = new ByteArrayCodeReader(this.PeRawBytes);
-
             this.Instructions = new InstructionList();
             this.Decoder = Decoder.Create(this.PeFile.Is64Bit ? 64 : 32, this.CodeReader);
         }
@@ -29,6 +28,7 @@ namespace ToyDisassembler
         public Decoder Decoder { get; }
 
         public HashSet<ulong> VisitedAddresses { get; } = new HashSet<ulong>();
+        public Queue<ulong> AddressesToAnalyze { get; } = new Queue<ulong>();
 
         private ulong CalculateIp()
         {
@@ -40,106 +40,67 @@ namespace ToyDisassembler
             return ip;
         }
 
-        private int FindEntryPointOffset()
-        {
-            var ep = this.PeFile.ImageNtHeaders.OptionalHeader.AddressOfEntryPoint;
-            Console.WriteLine($"AddressOfEntryPoint 0x{ep:X}");
-
-            // Find section header where ep virtual address is located
-            var section = this.PeFile.ImageSectionHeaders.First(x => AddressIsInSection(ep, x));
-            var startOffset = (int) (ep + section.PointerToRawData - section.VirtualAddress);
-
-            Console.WriteLine($"Found Entry Point Offset: 0x{startOffset:X}");
-
-            return startOffset;
-        }
-
         private static bool AddressIsInSection(uint address, IMAGE_SECTION_HEADER header)
         {
             return header.VirtualAddress <= address && address <= header.VirtualAddress + header.VirtualSize;
         }
 
-        private void Disassemble(ulong virtualAddr, ulong peOffset)
+        private void Disassemble()
         {
-            this.ChangeInstructionPointer(virtualAddr, peOffset);
-
-            while (true)
+            while (this.AddressesToAnalyze.Count > 0)
             {
-                this.Decoder.Decode(out var instruction);
-                this.Instructions.Add(instruction);
+                var virtAddr = this.AddressesToAnalyze.Dequeue();
+                this.ChangeInstructionPointer(virtAddr);
 
-                Console.ResetColor();
-
-                // After decoding, analyze the instruction
-                Console.WriteLine($"[0x{this.Decoder.IP - (ulong) instruction.ByteLength:X}] {instruction}");
                 Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.WriteLine($"Now disassembling 0x{virtAddr:X}");
 
-                // We do not know what is code, and what is data. We need to follow all jcc's and calls
-                // and disassemble the code there.
-
-                if (instruction.FlowControl == FlowControl.Next)
+                while (true)
                 {
-                    continue;
-                }
+                    this.Decoder.Decode(out var instr);
+                    this.Instructions.Add(instr);
 
-                Console.WriteLine($"[Flow Control Change] Type -> {instruction.FlowControl}");
+                    Console.ResetColor();
+                    Console.WriteLine($"[0x:{instr.IP:X}] {instr}");
+                    Console.ForegroundColor = ConsoleColor.Cyan;
 
-                switch (instruction.FlowControl)
-                {
-                    case FlowControl.Return:
-                        return;
-                    case FlowControl.IndirectCall:
-                    case FlowControl.IndirectBranch:
-                        Console.WriteLine(
-                            "[Flow Control Change] Indirect Call/Branch, probably IAT, not disassembling.");
+                    if (instr.FlowControl == FlowControl.Next || instr.FlowControl == FlowControl.Interrupt)
+                    {
                         continue;
-                    case FlowControl.Interrupt:
+                    }
+
+                    if (instr.FlowControl == FlowControl.Return || instr.FlowControl == FlowControl.IndirectBranch ||
+                        instr.FlowControl == FlowControl.IndirectCall)
+                    {
+                        break;
+                    }
+
+                    var targetVirtAddr = instr.NearBranchTarget;
+
+                    if (this.VisitedAddresses.Contains(targetVirtAddr))
+                    {
+                        break;
+                    }
+
+                    this.VisitedAddresses.Add(targetVirtAddr);
+
+                    if (instr.FlowControl == FlowControl.UnconditionalBranch)
+                    {
+                        this.ChangeInstructionPointer(targetVirtAddr);
                         continue;
+                    }
+
+                    Console.WriteLine($"Enqueueing 0x{targetVirtAddr:X}");
+                    this.AddressesToAnalyze.Enqueue(targetVirtAddr);
                 }
-
-                // Get new addr
-                var target = instruction.NearBranchTarget;
-                Console.WriteLine($"[Flow Control Change] Target -> 0x{target:X}");
-
-                if (this.VisitedAddresses.Contains(target))
-                {
-                    Console.WriteLine("Already visited address. Not analyzing.");
-
-                    continue;
-                }
-
-                this.VisitedAddresses.Add(target);
-
-                // Convert target to offset
-                var offset = this.ConvertVirtAddrToBinOffset(target);
-                Console.WriteLine($"[Flow Control Change] PE Offset -> 0x{offset:X}");
-
-                if (instruction.FlowControl == FlowControl.UnconditionalBranch)
-                {
-                    Console.WriteLine("[Flow Control Change] [Unconditional Branch] Followed jmp, disassembling.");
-                    this.ChangeInstructionPointer(target, offset);
-                    continue;
-                }
-
-                // We are at a conditional jump, save current pe offset and ip, and recursively disassemble
-                Console.WriteLine("[Flow Control] Conditional jmp, saving ip and offset and disassembling");
-
-                var currentIp = this.Decoder.IP;
-                var currentPePos = this.CodeReader.Position;
-                this.Disassemble(target, offset);
-
-                // Change execution back to where we left off
-                this.ChangeInstructionPointer(currentIp, (ulong) currentPePos);
-
-                //Console.ReadKey();
             }
         }
 
-        private void ChangeInstructionPointer(ulong target, ulong offset)
+        private void ChangeInstructionPointer(ulong virtAddr)
         {
-            this.Decoder.IP = target;
-            this.CodeReader.Position = (int) offset;
-            this.VisitedAddresses.Add(target);
+            this.Decoder.IP = virtAddr;
+            this.CodeReader.Position = (int) this.ConvertVirtAddrToBinOffset(virtAddr);
+            this.VisitedAddresses.Add(virtAddr);
         }
 
         private ulong ConvertVirtAddrToBinOffset(in ulong target)
@@ -148,9 +109,8 @@ namespace ToyDisassembler
             // VirtAddr + section_rawOffset - section va - image base = offset
 
             // Find the section this virtual addr is in
-            var address = target - this.PeFile.ImageNtHeaders.OptionalHeader.ImageBase;
-            //- this.PeFile.ImageRelocationDirectory[0].TypeOffsets[1].Offset;
 
+            var address = target - this.PeFile.ImageNtHeaders.OptionalHeader.ImageBase;
             var section = this.PeFile.ImageSectionHeaders.First(x => AddressIsInSection((uint) address, x));
 
             return address + section.PointerToRawData - section.VirtualAddress;
@@ -158,7 +118,35 @@ namespace ToyDisassembler
 
         public void StartDisassembly()
         {
-            this.Disassemble(this.CalculateIp(), (ulong) this.FindEntryPointOffset());
+            var epIp = this.CalculateIp();
+
+            if (epIp != this.PeFile.ImageNtHeaders.OptionalHeader.ImageBase)
+            {
+                this.AddressesToAnalyze.Enqueue(epIp);
+            }
+
+            if (this.PeFile.ExportedFunctions != null)
+            {
+                foreach (var export in this.PeFile.ExportedFunctions)
+                {
+                    var addr = this.PeFile.ImageNtHeaders.OptionalHeader.ImageBase + export.Address;
+
+                    if (this.AddressesToAnalyze.Contains(addr))
+                    {
+                        continue;
+                    }
+
+                    Console.WriteLine($"Going to analyze exported func {export.Name} @ 0x{addr:X}");
+                    this.AddressesToAnalyze.Enqueue(addr);
+                }
+            }
+
+            this.Disassemble();
+
+            foreach (var instr in this.Instructions.OrderBy(x => x.IP))
+            {
+                Console.WriteLine($"[0x{instr.IP:X}] {instr}");
+            }
         }
     }
 }
